@@ -174,7 +174,12 @@ def install(package_id: str, version: str='latest'):
     meta_path=next(dest.rglob('meta.yaml')); meta=yaml.safe_load(meta_path.read_text()) or {}
     l=lock_load(); l.setdefault('packages',{})[slug]={'version':meta.get('version','unknown'),'archive_hash':expected_hash or '','mode':'sync'}; lock_save(l)
     setup=dest/'setup.sh'
-    if setup.exists(): os.system(f'cd {dest} && bash setup.sh')
+    if setup.exists():
+        rc = os.system(f'cd {dest} && bash setup.sh')
+        code = os.waitstatus_to_exitcode(rc) if hasattr(os, 'waitstatus_to_exitcode') else (rc >> 8)
+        if code != 0:
+            typer.echo(f"setup.sh for '{slug}' failed (exit {code}). Package extracted but not fully configured.", err=True)
+            raise typer.Exit(1)
     # Post-setup: register schedules if defined
     schedules = meta.get('schedules', [])
     if schedules:
