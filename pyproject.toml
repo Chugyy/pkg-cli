@@ -1,0 +1,23 @@
+[project]
+name = "pkg-cli"
+version = "0.1.0"
+description = "Client CLI for the Package Hub — install, publish, and update AI agent packages."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Hugo Hoarau" }]
+keywords = ["package-manager", "cli", "ai-manager", "package-hub"]
+dependencies = ["typer", "requests", "pyyaml"]
+
+[project.urls]
+Homepage = "https://github.com/Chugyy/pkg-cli"
+
+[project.scripts]
+pkg = "pkg.cli:app"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["pkg"]
