@@ -123,9 +123,44 @@ def safe_extract(tar: tarfile.TarFile, dest: Path):
         tar.extractall(dest)
 
 @app.command()
-def login(email: str, password: str, hub_url: str = typer.Option('http://localhost:8000')):
+def login(email: str = typer.Argument(None), password: str = typer.Argument(None),
+          hub_url: str = typer.Option('http://localhost:8000'),
+          token: str = typer.Option(None, '--token', help='Authenticate with a personal access token instead of email/password')):
+    """Log in with email+password, or with a personal access token (--token)."""
+    if token:
+        c={'hub_url':hub_url,'token':token}; save_cfg(c); typer.echo('Logged in with token'); return
+    if not email or not password:
+        typer.echo('Provide <email> <password>, or use --token <PAT>', err=True); raise typer.Exit(1)
     r=requests.post(f'{hub_url}/api/auth/login', json={'email':email,'password':password}); r.raise_for_status()
     c={'hub_url':hub_url,'token':r.json()['token']}; save_cfg(c); typer.echo('Logged in')
+
+token_app = typer.Typer(help='Manage personal access tokens')
+app.add_typer(token_app, name='token')
+
+@token_app.command('create')
+def token_create(name: str):
+    """Create a personal access token (requires an existing session). Prints the raw token once."""
+    c=cfg(); r=requests.post(f"{c['hub_url']}/api/auth/tokens", headers=client_headers(), json={'name':name}); r.raise_for_status()
+    typer.echo(r.json()['token'])
+
+@token_app.command('list')
+def token_list():
+    """List your active access tokens (metadata only)."""
+    c=cfg(); r=requests.get(f"{c['hub_url']}/api/auth/tokens", headers=client_headers()); r.raise_for_status()
+    for t in r.json().get('items',[]):
+        last=t.get('lastUsedAt') or 'never'
+        typer.echo(f"{t['id']}  {t['name']}  {t['tokenPrefix']}…  (last used: {last})")
+
+@token_app.command('revoke')
+def token_revoke(token_id: str):
+    """Revoke one of your access tokens by id."""
+    c=cfg(); r=requests.delete(f"{c['hub_url']}/api/auth/tokens/{token_id}", headers=client_headers()); r.raise_for_status()
+    typer.echo('Revoked')
+
+@app.command()
+def auth(token: str, hub_url: str = typer.Option('http://localhost:8000')):
+    """Authenticate directly with a personal access token (writes config without a password)."""
+    c={'hub_url':hub_url,'token':token}; save_cfg(c); typer.echo('Authenticated with token')
 
 @app.command()
 def search(query: str='', type: str|None=None, channel: str|None=None):
