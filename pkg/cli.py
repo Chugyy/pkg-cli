@@ -168,8 +168,11 @@ def install(package_id: str, version: str='latest'):
                 typer.echo(conflict, err=True)
             raise typer.Exit(1)
     dest=PKG_DIR/slug
-    if dest.exists(): shutil.rmtree(dest)
-    dest.mkdir(parents=True)
+    # Extract OVER the existing install instead of wiping it. Service packages
+    # keep runtime data beside their code (.env, *.db, .venv, node_modules,
+    # .next, data/) that is not part of the archive — a blind rmtree would
+    # destroy secrets and databases on every update.
+    dest.mkdir(parents=True, exist_ok=True)
     with tarfile.open(tmp,'r:gz') as tar: safe_extract(tar, dest)
     meta_path=next(dest.rglob('meta.yaml')); meta=yaml.safe_load(meta_path.read_text()) or {}
     l=lock_load(); l.setdefault('packages',{})[slug]={'version':meta.get('version','unknown'),'archive_hash':expected_hash or '','mode':'sync'}; lock_save(l)
