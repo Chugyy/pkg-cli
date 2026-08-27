@@ -1,13 +1,13 @@
 [project]
 name = "pkg-cli"
-version = "0.2.0"
+version = "0.2.1"
 description = "Client CLI for the Package Hub — install, publish, and update AI agent packages."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "Hugo Hoarau" }]
 keywords = ["package-manager", "cli", "ai-manager", "package-hub"]
-dependencies = ["typer", "requests", "pyyaml"]
+dependencies = ["typer", "requests", "pyyaml", "httpx", "rich"]
 
 [project.urls]
 Homepage = "https://github.com/Chugyy/pkg-cli"
