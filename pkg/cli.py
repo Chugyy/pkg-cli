@@ -20,12 +20,30 @@ from .migrate_legacy import migrate_legacy_cmd
 # fichiers macOS, `.env`) qui n'ont jamais leur place dans une distribution, ET
 # `/user` — pas un artefact jetable, mais l'espace de donnee UTILISATEUR locale
 # (runtime state, config personnelle) : jamais distribuable, mais preserve sur
-# disque a l'install/update (cf. `safe_extract`), pas supprime.
+# disque a l'install/update (cf. `safe_extract`), pas supprime. Et `.profiles`,
+# 3e categorie : les identifiants locaux du destinataire, jamais distribues
+# (a toute profondeur, quelle que soit la casse : cf. `_is_profiles_path`) et
+# preserves a l'extraction (cf. `safe_extract`).
 DEFAULT_PUBLISH_IGNORES = [
     '.venv', '.runs', '.executions', '__pycache__', '*.egg-info',
     '*.bak', '_legacy', 'tmp', '.env', '._*', '.DS_Store',
-    'node_modules', '.next', '.git', '/user',
+    'node_modules', '.next', '.git', '/user', '.profiles',
 ]
+
+
+def _is_profiles_path(rel: str) -> bool:
+    """True si un segment de `rel` vaut `.profiles`, SANS tenir compte de la casse.
+
+    Predicat partage par les canaux sortants (`_make_publish_filter`,
+    `_make_copytree_ignore`) et par l'extraction (`safe_extract`, `install`) :
+    une seule definition de ce qu'est un chemin de profil. Independant de
+    `_path_is_ignored` (fnmatch sensible a la casse sur un FS sensible a la
+    casse) : `.Profiles` ou `.PROFILES` designent le meme dossier sur un FS
+    insensible a la casse (macOS, Windows) et ne doivent pas echapper au filtre.
+    `.profiles.bak` ou `my.profiles` ne sont PAS des chemins de profil.
+    """
+    # rstrip(' .') : Win32 ramene `.profiles.` / `.profiles ` a `.profiles` a l'ecriture.
+    return any(seg.rstrip(' .').casefold() == '.profiles' for seg in rel.replace(os.sep, '/').split('/'))
 
 
 def _load_gitignore_patterns(path: Path) -> list[str]:
@@ -127,6 +145,9 @@ def _make_publish_filter(patterns: list[str]):
     Wrapper fin autour de `_path_is_ignored` : ne garde que ce qui ne peut pas
     descendre dans la fonction pure de matching —
 
+    - exclusion de tout chemin `.profiles` (`_is_profiles_path` : a toute
+      profondeur, fichier ou dossier, sans tenir compte de la casse), meme sans
+      .gitignore ni .pkg-ignore : les identifiants locaux ne partent jamais.
     - skip integral des symlinks / hardlinks : le hub rejette tout tarball qui
       en contient, et un symlink extrait peut ecrire hors du dossier cible.
     - court-circuit de '.' et '' (la racine de l'archive, arcname='.').
@@ -146,10 +167,26 @@ def _make_publish_filter(patterns: list[str]):
         rel = _normalize_rel(info.name)
         if not rel:
             return info
+        if _is_profiles_path(rel):
+            return None
         if _path_is_ignored(rel, patterns):
             return None
         return info
     return _filter
+
+
+def _link_targets_profiles(full_path: str, real_root: str) -> bool:
+    """True si `full_path` est un lien dont la cible resolue passe par `.profiles`.
+
+    La cible est lue relativement a `real_root` quand elle est dessous (un
+    parent du projet ne doit pas compter), sinon en chemin complet.
+    """
+    if not os.path.islink(full_path):
+        return False
+    target = os.path.realpath(full_path)
+    if target == real_root or target.startswith(real_root + os.sep):
+        target = os.path.relpath(target, real_root)
+    return _is_profiles_path(target)
 
 
 def _make_copytree_ignore(patterns: list[str], source_root):
@@ -175,14 +212,23 @@ def _make_copytree_ignore(patterns: list[str], source_root):
     tarfile de publish/pr, ancrage racine inclus). La normalisation finale
     (separateurs OS, prefixe `./`, `/` de tete) passe par `_normalize_rel`,
     partagee avec `_make_publish_filter` et `safe_extract`.
+
+    Exclut aussi tout chemin `.profiles` (`_is_profiles_path`) et tout LIEN dont
+    la cible resolue a un segment `.profiles` (ex. `cfg -> ../.profiles`) :
+    copytree (symlinks=False) copierait sinon le contenu des profils sous un
+    autre nom.
     """
+    real_root = os.path.realpath(source_root)
+
     def _ignore(dir_path: str, names: list[str]) -> set[str]:
         rel_dir = os.path.relpath(dir_path, source_root)
         excluded: set[str] = set()
         for name in names:
             raw = name if rel_dir == '.' else f"{rel_dir}/{name}"
             rel = _normalize_rel(raw)
-            if _path_is_ignored(rel, patterns):
+            if _is_profiles_path(rel) or _path_is_ignored(rel, patterns):
+                excluded.add(name)
+            elif _link_targets_profiles(os.path.join(dir_path, name), real_root):
                 excluded.add(name)
         return excluded
     return _ignore
@@ -515,6 +561,22 @@ def _parse_deps_validation_body(r, canonical_id: str) -> None:
     raise typer.Exit(1)
 
 
+def _resolves_under_profiles(dest: Path, rel: str) -> bool:
+    """True si `dest/rel`, une fois resolu (liens preexistants du destinataire
+    compris), tombe sous un segment `.profiles` relatif a `dest`.
+
+    Protege un profil existant d'une ecriture a travers un lien local
+    (`cfg -> .profiles` puis un membre `cfg/_default`).
+    """
+    real_dest = Path(os.path.realpath(dest))
+    resolved = Path(os.path.realpath(dest / rel))
+    try:
+        sub = resolved.relative_to(real_dest)
+    except ValueError:
+        return False
+    return _is_profiles_path(sub.as_posix())
+
+
 def safe_extract(tar: tarfile.TarFile, dest: Path):
     """Extract `tar` into `dest`, safely.
 
@@ -525,8 +587,17 @@ def safe_extract(tar: tarfile.TarFile, dest: Path):
     always empty at this point. On an update, any archive member whose
     top-level path segment is `user` is skipped so the archive can never
     overwrite locally-preserved user data (`dest/user/`), whether the
-    archive predates mod-4's publish-time exclusion or is malicious. First
-    installs extract every member unfiltered.
+    archive predates mod-4's publish-time exclusion or is malicious.
+
+    `.profiles/` (recipient credentials) is protected on EVERY extraction,
+    first install and update alike: any member with a `.profiles` path segment
+    (case-insensitive, directories included) is skipped, as is any symlink or
+    hardlink whose target has such a segment (it would otherwise let a later
+    member write through to the profiles under another name). On an update,
+    any member whose resolved path under `dest` (the recipient's pre-existing
+    links included) falls under a `.profiles` segment is skipped too. This
+    filter is computed BEFORE the Python-version branch, so the legacy
+    (<3.12) path gets it as well. Nothing of a skipped member is ever echoed.
 
     Absolute-path / traversal validation is done UNCONDITIONALLY, for every
     member, BEFORE branching on the Python version (review k1 W-1 fix): a
@@ -551,12 +622,49 @@ def safe_extract(tar: tarfile.TarFile, dest: Path):
             if link.is_absolute() or '..' in link.parts:
                 raise ValueError(f'Unsafe symlink in archive: {m.name} -> {m.linkname}')
     skip_user = any(dest.iterdir())
-    members = all_members
-    if skip_user:
-        members = [
-            m for m in all_members
-            if not _path_is_ignored(_normalize_rel(m.name), ['/user'])
-        ]
+    # Liens vers `.profiles` : ecartes, ainsi que tout membre range SOUS leur
+    # nom (`cfg/_default` apres `cfg -> .profiles`), qui creerait sinon un
+    # dossier `cfg/` parasite chez le destinataire. La cible est resolue :
+    # symlink relatif a son dossier, lien physique relatif a la racine ; liens
+    # preexistants du destinataire compris ; chaine de liens de l'archive
+    # suivie jusqu'au point fixe.
+    links = []
+    for m in all_members:
+        if not (m.issym() or m.islnk()):
+            continue
+        rel = _normalize_rel(m.name)
+        if m.issym():
+            parent = rel.rpartition('/')[0]
+            target = _normalize_rel(f'{parent}/{m.linkname}' if parent else m.linkname)
+        else:
+            target = _normalize_rel(m.linkname)
+        links.append((rel, target))
+    profile_links = {
+        rel for rel, target in links
+        if _is_profiles_path(target) or _resolves_under_profiles(dest, target)
+    }
+    changed = True
+    while changed:
+        changed = False
+        for rel, target in links:
+            if rel not in profile_links and any(
+                target == pl or target.startswith(pl + '/') for pl in profile_links
+            ):
+                profile_links.add(rel)
+                changed = True
+    members = []
+    for m in all_members:
+        rel = _normalize_rel(m.name)
+        if _is_profiles_path(rel):
+            continue
+        if any(rel == link or rel.startswith(link + '/') for link in profile_links):
+            continue
+        if skip_user:
+            if _path_is_ignored(rel, ['/user']):
+                continue
+            if _resolves_under_profiles(dest, rel):
+                continue
+        members.append(m)
     if sys.version_info >= (3, 12):
         tar.extractall(dest, members=members, filter='data')
     else:
@@ -655,6 +763,35 @@ def info(package_id: str):
     typer.echo(json.dumps(r.json(), indent=2, default=str))
 
 
+def _render_scan_failed(detail: dict):
+    """Affiche un refus `scan_failed` du Hub : la regle, puis un chemin par ligne.
+
+    Les champs sont lus par LISTE BLANCHE (`rule` / `pattern` / `type` pour le
+    libelle, `file` pour le chemin) : jamais `masked_value` ni aucun autre champ
+    d'un finding, pour qu'aucune valeur sensible ne soit reaffichee. Les
+    findings de meme libelle sont regroupes sous une seule ligne de regle ; un
+    finding sans fichier n'affiche que son libelle. Sort en code 1.
+    """
+    findings = detail.get('findings')
+    grouped: dict[str, list[str]] = {}
+    for finding in findings if isinstance(findings, list) else []:
+        if not isinstance(finding, dict):
+            continue
+        label = finding.get('rule') or finding.get('pattern') or finding.get('type')
+        if not label:
+            continue
+        files = grouped.setdefault(str(label), [])
+        file = finding.get('file')
+        if file and str(file) not in files:
+            files.append(str(file))
+    typer.echo("The Hub refused the package (scan failed):", err=True)
+    for label, files in grouped.items():
+        typer.echo(label, err=True)
+        for file in files:
+            typer.echo(f"  {file}", err=True)
+    raise typer.Exit(1)
+
+
 @app.command()
 def publish(
     path: Path,
@@ -694,6 +831,9 @@ def publish(
 
     The tarball never includes `user/` (local, non-distributable user data —
     see `DEFAULT_PUBLISH_IGNORES`), regardless of the package's own .gitignore.
+    It never includes `.profiles/` either (at any depth, any letter case): a
+    profile never leaves the machine. To ship a value, put it in the package's
+    code or declaration. The Hub also refuses `.profiles/` (403).
     """
     meta_path = path / 'meta.yaml'
     if not meta_path.exists():
@@ -803,6 +943,17 @@ def publish(
             err=True,
         )
         raise typer.Exit(1)
+    if r.status_code in (400, 403) and r.headers.get('content-type', '').startswith('application/json'):
+        # Refus de scan du Hub (`.profiles/` en 403, autres refus de scan en
+        # 400) : detail dict `{error: 'scan_failed', findings}`. Teste AVANT la
+        # branche 403 d'owner ci-dessous (detail str), qui reste inchangee.
+        try:
+            scan_body = r.json()
+        except ValueError:
+            scan_body = None
+        scan_detail = scan_body.get('detail') if isinstance(scan_body, dict) else None
+        if isinstance(scan_detail, dict) and scan_detail.get('error') == 'scan_failed':
+            _render_scan_failed(scan_detail)
     if r.status_code == 403:
         body = r.json() if r.headers.get('content-type', '').startswith('application/json') else {}
         detail = body.get('detail') if isinstance(body, dict) else None
@@ -948,7 +1099,10 @@ def install(
     lock file keys entries by `canonical_id` (the global address).
 
     On an update over an already-installed package, `user/` is always
-    preserved (never overwritten by the archive). Rollback on extraction
+    preserved (never overwritten by the archive). `.profiles/` (local
+    credentials, at any depth) is never created, modified or traversed by the
+    extraction, on a first install as on an update: see `safe_extract`. It is
+    never distributed either (`publish`, `pr create`, `fork`). Rollback on extraction
     failure is conditional: a dest that pre-existed before this install is
     left on disk in a partial state instead of being wiped — re-run
     `pkg install` to repair it.
@@ -1079,6 +1233,7 @@ def install(
     meta_path = next(
         p for p in dest.rglob('meta.yaml')
         if not _path_is_ignored(str(p.relative_to(dest)).replace(os.sep, '/'), ['/user'])
+        and not _is_profiles_path(str(p.relative_to(dest)))
     )
     meta = yaml.safe_load(meta_path.read_text()) or {}
     with _lock_mutex:
@@ -1201,6 +1356,9 @@ def fork(
     Fail-fast order (mod-8.fm-7): the source-installed check runs BEFORE any
     network call, so a typo'd or never-installed source never triggers a
     whoami round-trip.
+
+    The copy never includes `.profiles/` (nor a link pointing into it): the
+    fork carries the code, not the source's local credentials.
     """
     source_canonical_id, _source_fs_slug, _version = _parse_package_ref(source_ref)
 

@@ -148,8 +148,22 @@ def _ensure_ok(r: requests.Response) -> dict:
 
     Returns the parsed JSON body on success. Never echoes a raw JSON
     envelope or a Python stack trace to the user.
+
+    A ``scan_failed`` refusal (``detail`` dict, any status >= 400: `.profiles/`
+    in 403, other scan refusals in 400) is rendered as the rule plus one path
+    per line by ``cli._render_scan_failed`` — covers ``pr create`` and
+    ``pr merge``.
     """
     if r.status_code >= 400:
+        try:
+            body = r.json()
+        except ValueError:
+            body = None
+        detail = body.get("detail") if isinstance(body, dict) else None
+        if isinstance(detail, dict) and detail.get("error") == "scan_failed":
+            from .cli import _render_scan_failed
+
+            _render_scan_failed(detail)
         typer.echo(f"Error: {_extract_detail(r)}", err=True)
         raise typer.Exit(1)
     try:
@@ -166,7 +180,8 @@ def _build_tarball(path: Path) -> bytes:
     This guarantees secrets (.env, __pycache__, .venv, ...) never leak into
     a PR archive (mod-22.output.fm-10). The local user space (`user/`) is
     also excluded now, not just secrets — it never belongs in a distributed
-    archive either.
+    archive either. `.profiles/` (local credentials, any depth, any letter
+    case) is excluded too: a profile never leaves the machine.
     """
     from .cli import (
         DEFAULT_PUBLISH_IGNORES,
@@ -196,7 +211,10 @@ def pr_create(
         None, "--target-version", help="Target version to merge into (optional)."
     ),
 ) -> None:
-    """Open a new PR against a package, uploading a fresh tarball of *path*."""
+    """Open a new PR against a package, uploading a fresh tarball of *path*.
+
+    The tarball never includes `.profiles/` (local credentials): a profile never leaves the machine.
+    """
     owner, name = _parse_owner_name(ref)
     c, headers = _ctx()
 

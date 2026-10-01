@@ -62,6 +62,27 @@ pkg publish <path> --channel <ch>  # publish a package
 Every download is verified against the `X-Archive-Hash` header (SHA-256) before
 extraction. Archives are extracted with path-traversal and symlink protection.
 
+### Profiles (`.profiles/`) never leave the machine
+
+A profile (`.profiles/`, a tool's local credentials) is never sent to the Hub. A
+value that must ship with a package belongs in its code or declaration
+(`meta.yaml` and sidecar), not in a profile.
+
+- **Excluded on upload**: `pkg publish`, `pkg pr create` and `pkg fork` drop every
+  `.profiles` path (file or directory, at any depth, any case), with no
+  `.gitignore` or `.pkg-ignore` needed. A link pointing into `.profiles/` is dropped
+  on fork too.
+- **Preserved on extraction**: `pkg install` and `pkg sync` (like `pkg self-update`)
+  never create, modify or traverse `.profiles/` on the recipient's side, on first
+  install as on update. Links (symbolic or hard) into `.profiles/` are dropped.
+- **Refused by the Hub**: if an archive still contains `.profiles/`, the Hub answers
+  403 (`scan_failed`). The CLI prints the rule, then one path per line, never a value.
+
+Known limits: an older CLI (without this filter) is not protected on extraction —
+update `pkg`; `pkg remove` deletes the package directory, `.profiles/` included; a
+`setup.sh` must never write under `.profiles/` (it runs with the recipient's rights,
+the CLI does not control it).
+
 ## License
 
 MIT
